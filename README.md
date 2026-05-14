@@ -1,231 +1,176 @@
-/**
- * MCTiers Lookup - Background Service Worker
- * Handles all API calls, caching, rate-limiting, and retry logic.
- */
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MCTiers Clone</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
 
-const BASE_URL = 'https://mctiers.com/api/v2';
-const CACHE_TTL_MS = 3 * 60 * 1000; // 3 minutes
-const MIN_REQUEST_INTERVAL_MS = 1000; // 1 req/sec
+<div class="container">
+    <h2>🏆 Minecraft Rankings</h2>
+    
+    <div class="icon-bar">
+        <img src="vanilla.svg" title="Vanilla">
+        <img src="smp.svg" title="SMP">
+        <img src="sword.svg" title="Sword">
+        <img src="mace.svg" title="Mace">
+        <img src="uhc.svg" title="UHC">
+        <img src="pot.svg" title="Pot">
+    </div>
 
-// ─── In-memory cache ────────────────────────────────────────────────────────
-const memCache = new Map(); // key → { data, expiresAt }
+    <table class="leaderboard">
+        <thead>
+            <tr>
+                <th>#</th>
+                <th>PLAYER</th>
+                <th>REGION</th>
+                <th>TIERS</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td class="rank">1.</td>
+                <td class="player-info">
+                    <img src="https://mc-heads.net/avatar/ItzRealMe/32" alt="Skin">
+                    <div class="name-box">
+                        <span class="name">ItzRealMe</span>
+                        <span class="title">Combat Master</span>
+                    </div>
+                </td>
+                <td><span class="region na">NA</span></td>
+                <td class="tiers">
+                    <span class="tier ht1">HT1</span>
+                    <span class="tier lt2">LT2</span>
+                    <img src="hardcoreHeart.svg" class="heart-icon">
+                </td>
+            </tr>
+            
+            <tr>
+                <td class="rank">2.</td>
+                <td class="player-info">
+                    <img src="https://mc-heads.net/avatar/coldified/32" alt="Skin">
+                    <div class="name-box">
+                        <span class="name">coldified</span>
+                        <span class="title">Combat Master</span>
+                    </div>
+                </td>
+                <td><span class="region eu">EU</span></td>
+                <td class="tiers">
+                    <span class="tier lt1">LT1</span>
+                    <span class="tier ht3">HT3</span>
+                </td>
+            </tr>
+        </tbody>
+    </table>
+</div>
 
-function cacheGet(key) {
-  const entry = memCache.get(key);
-  if (!entry) return null;
-  if (Date.now() > entry.expiresAt) { memCache.delete(key); return null; }
-  return entry.data;
+</body>
+</html>
+body {
+    background-color: #0f111a;
+    color: white;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
 }
 
-function cacheSet(key, data) {
-  memCache.set(key, { data, expiresAt: Date.now() + CACHE_TTL_MS });
-  // Mirror to chrome.storage for persistence across SW restarts
-  chrome.storage.local.set({ [key]: { data, expiresAt: Date.now() + CACHE_TTL_MS } });
+.container {
+    max-width: 900px;
+    margin: 50px auto;
+    padding: 20px;
 }
 
-async function cacheGetWithStorage(key) {
-  const mem = cacheGet(key);
-  if (mem) return mem;
-  // Try chrome.storage
-  return new Promise(resolve => {
-    chrome.storage.local.get(key, result => {
-      const entry = result[key];
-      if (entry && Date.now() < entry.expiresAt) {
-        memCache.set(key, entry); // warm mem cache
-        resolve(entry.data);
-      } else {
-        resolve(null);
-      }
-    });
-  });
+/* Icon Navigation */
+.icon-bar {
+    display: flex;
+    gap: 15px;
+    background: #1a1d29;
+    padding: 10px;
+    border-radius: 8px;
+    margin-bottom: 20px;
 }
 
-// ─── Rate limiter ────────────────────────────────────────────────────────────
-let lastRequestTime = 0;
-const requestQueue = [];
-let processingQueue = false;
-
-function queueRequest(fn) {
-  return new Promise((resolve, reject) => {
-    requestQueue.push({ fn, resolve, reject });
-    if (!processingQueue) drainQueue();
-  });
+.icon-bar img {
+    width: 25px;
+    cursor: pointer;
+    filter: grayscale(1);
+    transition: 0.3s;
 }
 
-async function drainQueue() {
-  processingQueue = true;
-  while (requestQueue.length > 0) {
-    const now = Date.now();
-    const elapsed = now - lastRequestTime;
-    if (elapsed < MIN_REQUEST_INTERVAL_MS) {
-      await sleep(MIN_REQUEST_INTERVAL_MS - elapsed);
-    }
-    const { fn, resolve, reject } = requestQueue.shift();
-    lastRequestTime = Date.now();
-    try { resolve(await fn()); } catch (e) { reject(e); }
-  }
-  processingQueue = false;
+.icon-bar img:hover {
+    filter: grayscale(0);
 }
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-// ─── Fetch with exponential backoff ──────────────────────────────────────────
-async function fetchWithBackoff(url, attempt = 0) {
-  const maxAttempts = 4;
-  try {
-    const res = await fetch(url);
-    if (res.status === 429 || res.status >= 500) {
-      if (attempt < maxAttempts) {
-        const delay = Math.pow(2, attempt) * 500 + Math.random() * 300;
-        await sleep(delay);
-        return fetchWithBackoff(url, attempt + 1);
-      }
-      throw new ApiError(res.status === 429 ? 'RATE_LIMITED' : 'SERVER_ERROR', res.status);
-    }
-    if (res.status === 404) throw new ApiError('NOT_FOUND', 404);
-    if (!res.ok) throw new ApiError('SERVER_ERROR', res.status);
-    return res.json();
-  } catch (e) {
-    if (e instanceof ApiError) throw e;
-    throw new ApiError('NETWORK_ERROR', 0);
-  }
+/* Table Style */
+.leaderboard {
+    width: 100%;
+    border-collapse: collapse;
+    background: #161923;
+    border-radius: 10px;
+    overflow: hidden;
 }
 
-class ApiError extends Error {
-  constructor(type, status) {
-    super(type);
-    this.type = type;
-    this.status = status;
-  }
+th {
+    text-align: left;
+    padding: 15px;
+    background: #1a1d29;
+    font-size: 12px;
+    color: #888;
 }
 
-// ─── API helpers ─────────────────────────────────────────────────────────────
-
-/** Fetch player profile by name (includes rankings + recent tests). */
-async function fetchProfileByName(name) {
-  const url = `${BASE_URL}/profile/by-name/${encodeURIComponent(name)}?tests`;
-  return fetchWithBackoff(url);
+td {
+    padding: 12px 15px;
+    border-bottom: 1px solid #252836;
 }
 
-/** Fetch player profile by UUID (includes rankings + tests). */
-async function fetchProfileByUUID(uuid) {
-  const url = `${BASE_URL}/profile/${encodeURIComponent(uuid)}?tests`;
-  return fetchWithBackoff(url);
+/* Player Section */
+.player-info {
+    display: flex;
+    align-items: center;
+    gap: 10px;
 }
 
-// ─── Message handler is defined after prefetchAvatar below ───────────────────
-
-async function handleLookup(rawName) {
-  const name = rawName.trim();
-  const cacheKey = `player:${name.toLowerCase()}`;
-
-  const cached = await cacheGetWithStorage(cacheKey);
-  if (cached) return { ok: true, data: cached, fromCache: true };
-
-  // Try primary name, then capitalized variant
-  const data = await queueRequest(async () => {
-    try {
-      return await fetchProfileByName(name);
-    } catch (e) {
-      if (e.type === 'NOT_FOUND') {
-        // Try capitalized variant
-        const capitalized = name.charAt(0).toUpperCase() + name.slice(1).toLowerCase();
-        if (capitalized !== name) return fetchProfileByName(capitalized);
-      }
-      throw e;
-    }
-  });
-
-  // Enrich: transform rankings object into sorted flat array
-  const gamemodes = Object.entries(data.rankings || {})
-    .map(([slug, ranking]) => ({ slug, ...ranking }))
-    .sort((a, b) => a.slug.localeCompare(b.slug));
-
-  // Sort tests desc by timestamp
-  const tests = (data.tests || []).sort((a, b) => b.at - a.at);
-
-  const result = {
-    uuid: data.uuid,
-    name: data.name,
-    region: data.region,
-    points: data.points,
-    overall: data.overall,
-    gamemodes,
-    tests,
-    firstTest: tests.length ? tests[tests.length - 1] : null,
-    // 64px exactly matches the display size — no wasted bytes
-    skinUrl: `https://crafatar.com/avatars/${data.uuid}?size=64&overlay=true`,
-    profileUrl: `https://mctiers.com/player/${data.name}`,
-  };
-
-  cacheSet(cacheKey, result);
-
-  // Fire-and-forget: prime the avatar into Cache Storage so the popup
-  // gets a cache hit the instant it renders the PlayerAvatar component.
-  prefetchAvatar(data.uuid, result.skinUrl);
-
-  return { ok: true, data: result };
+.player-info img {
+    width: 32px;
+    height: 32px;
+    border-radius: 4px;
 }
 
-function classifyError(e) {
-  if (!(e instanceof ApiError)) return { type: 'UNKNOWN', message: 'An unexpected error occurred.' };
-  switch (e.type) {
-    case 'NOT_FOUND':    return { type: 'NOT_FOUND', message: 'Player not found. Check the spelling and try again.' };
-    case 'RATE_LIMITED': return { type: 'RATE_LIMITED', message: 'Too many requests — please wait a moment.' };
-    case 'SERVER_ERROR': return { type: 'SERVER_ERROR', message: 'MCTiers is having server issues. Try again shortly.' };
-    case 'NETWORK_ERROR':return { type: 'NETWORK_ERROR', message: 'Network error. Check your connection.' };
-    default:             return { type: 'UNKNOWN', message: 'Something went wrong.' };
-  }
+.name-box .name {
+    display: block;
+    font-weight: bold;
+    font-size: 14px;
 }
 
-// ─── Avatar Cache Storage prefetch ────────────────────────────────────────────
-const AVATAR_CACHE_NAME = 'mctiers-avatars-v1';
-
-/**
- * Pre-fetch and store the player's 64px avatar into Cache Storage.
- * Silently no-ops on any error — avatar loading in the popup degrades
- * gracefully to a direct fetch if this hasn't run yet.
- *
- * Uses Cache Storage (not the data cache) so the browser's standard
- * HTTP cache headers on crafatar.com are also respected.
- *
- * @param {string} uuid       Player UUID
- * @param {string} [skinUrl]  Full crafatar URL; constructed if omitted
- */
-async function prefetchAvatar(uuid, skinUrl) {
-  if (!uuid) return;
-  const url = skinUrl || `https://crafatar.com/avatars/${uuid}?size=64&overlay=true`;
-
-  try {
-    const cache = await caches.open(AVATAR_CACHE_NAME);
-
-    // Only fetch if not already cached
-    const existing = await cache.match(url);
-    if (existing) return; // already warm
-
-    const resp = await fetch(url);
-    if (resp.ok) {
-      await cache.put(url, resp);
-    }
-  } catch {
-    // Network error, Cache API unavailable, etc. — silently ignore.
-  }
+.name-box .title {
+    font-size: 11px;
+    color: #ffcc00;
 }
 
-// ─── Message handler ─────────────────────────────────────────────────────────
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.type === 'LOOKUP_PLAYER') {
-    handleLookup(msg.name).then(sendResponse).catch(e => {
-      sendResponse({ error: classifyError(e) });
-    });
-    return true; // keep channel open for async response
-  }
+/* Regions & Tiers */
+.region {
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: bold;
+}
 
-  if (msg.type === 'PREFETCH_AVATAR') {
-    // Popup requests a prefetch (e.g. for a cached player result that
-    // was served before prefetchAvatar had a chance to run).
-    prefetchAvatar(msg.uuid, msg.skinUrl);
-    // No response needed — fire and forget from popup's perspective.
-    return false;
-  }
-});
+.na { background: #ff4444; }
+.eu { background: #44bb44; }
+
+.tier {
+    padding: 2px 6px;
+    border-radius: 12px;
+    font-size: 10px;
+    margin-right: 5px;
+    font-weight: bold;
+}
+
+.ht1 { background: gold; color: black; }
+.lt1 { background: #c0c0c0; color: black; }
+.lt2 { background: #cd7f32; color: black; }
+
+.heart-icon {
+    width: 18px;
+    vertical-align: middle;
+}
